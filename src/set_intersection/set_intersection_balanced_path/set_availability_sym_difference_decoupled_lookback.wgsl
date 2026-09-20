@@ -1,0 +1,563 @@
+// ============================================================================
+// Set Availability - Symmetric Difference with Decoupled Lookback
+//
+// Single-pass approach using Decoupled Lookback for prefix sum computation.
+// Combines Count + Scan + Write in one kernel.
+//
+// Flow:
+// 1. Read partition boundaries from DPI
+// 2. Load A and B data into shared memory
+// 3. Each thread runs Local BalancedPath to find its starting position
+// 4. Each thread runs SerialSetSymDifference to get results
+// 5. Workgroup exclusive scan to compute local offsets and total
+// 6. Thread 0 performs Decoupled Lookback to get global offset
+// 7. All threads scatter results to output
+//
+// For symmetric difference ((A \ B) ∪ (B \ A)):
+// Emit elements that are in A or B but NOT in both
+// - If A < B: emit A, advance A
+// - If B < A: emit B, advance B
+// - If A == B: advance both, no emit (element in both)
+//
+// Advantages over 4-phase:
+// - Single kernel for count + scan + write
+// - No separate prefix sum phase
+// - Deterministic output order (unlike atomic version)
+// ============================================================================
+
+// ============================================================================
+// Bindings
+// ============================================================================
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+@group(0) @binding(2) var<storage, read> dpi: array<u32>;
+@group(0) @binding(3) var<storage, read_write> state: array<atomic<u32>>;
+@group(0) @binding(4) var<storage, read_write> output: array<u32>;
+@group(0) @binding(5) var<storage, read_write> total_count: array<atomic<u32>, 1>;
+@group(0) @binding(6) var<uniform> a_length: u32;
+@group(0) @binding(7) var<uniform> b_length: u32;
+@group(0) @binding(8) var<uniform> num_wg_total: u32;
+
+// ============================================================================
+// Constants
+// ============================================================================
+const NT: u32 = 256u;           // Threads per workgroup
+const VT: u32 = 7u;             // Values per thread
+const NV: u32 = NT * VT;        // Total elements per workgroup = 1792
+
+const STAR_MASK: u32 = 0x80000000u;
+const INDEX_MASK: u32 = 0x7FFFFFFFu;
+const MAX_DISPATCH_X: u32 = 65535u;
+
+// Decoupled Lookback state flags
+const STATUS_NOT_READY: u32 = 0u;
+const STATUS_PARTIAL: u32 = 1u;
+const STATUS_INCLUSIVE: u32 = 2u;
+
+// State encoding: bits 31-30 = flag, bits 29-0 = value
+const STATUS_SHIFT: u32 = 30u;
+const VALUE_MASK: u32 = 0x3FFFFFFFu;
+
+// ============================================================================
+// Shared Memory Layout
+// ============================================================================
+var<workgroup> keys_shared: array<u32, 1801>;
+
+// Workgroup-level variables
+var<workgroup> wg_a0: u32;
+var<workgroup> wg_a1: u32;
+var<workgroup> wg_b0: u32;
+var<workgroup> wg_b1: u32;
+var<workgroup> wg_a_count: u32;
+var<workgroup> wg_b_count: u32;
+var<workgroup> wg_b_start: u32;
+var<workgroup> wg_extended: bool;
+var<workgroup> wg_bit0: u32;
+
+// For workgroup-level scan
+var<workgroup> shared_scan: array<u32, NT>;
+var<workgroup> wg_local_total: u32;
+var<workgroup> wg_exclusive_prefix: u32;
+
+// ============================================================================
+// State Pack/Unpack Functions
+// ============================================================================
+fn pack_state(flag: u32, value: u32) -> u32 {
+    return (flag << STATUS_SHIFT) | (value & VALUE_MASK);
+}
+
+fn unpack_flag(packed: u32) -> u32 {
+    return packed >> STATUS_SHIFT;
+}
+
+fn unpack_value(packed: u32) -> u32 {
+    return packed & VALUE_MASK;
+}
+
+// ============================================================================
+// Helper: Convert 2D workgroup_id to 1D index
+// ============================================================================
+fn get_workgroup_index(wg_id: vec3<u32>) -> u32 {
+    return wg_id.x + wg_id.y * MAX_DISPATCH_X;
+}
+
+// ============================================================================
+// DeviceLoad2ToShared
+// ============================================================================
+fn device_load_2_to_shared(
+    tid: u32,
+    a_global_offset: u32,
+    a_load_count: u32,
+    b_global_offset: u32,
+    b_load_count: u32,
+    b_shared_start: u32
+) {
+    var i = tid;
+    while (i < a_load_count) {
+        keys_shared[i] = a[a_global_offset + i];
+        i += NT;
+    }
+
+    i = tid;
+    while (i < b_load_count) {
+        keys_shared[b_shared_start + i] = b[b_global_offset + i];
+        i += NT;
+    }
+}
+
+// ============================================================================
+// Local Balanced Path with Biased Binary Search
+// ============================================================================
+
+fn get_local_biased_levels(partition_size: u32) -> u32 {
+    if (partition_size >= 512u) { return 4u; }
+    if (partition_size >= 128u) { return 3u; }
+    if (partition_size >= 32u)  { return 2u; }
+    if (partition_size >= 16u)  { return 1u; }
+    return 0u;
+}
+
+fn lower_bound_local_a(end_exclusive: u32, key: u32, levels: u32) -> u32 {
+    var lo: u32 = 0u;
+    var hi: u32 = end_exclusive;
+
+    if (levels >= 4u && lo < hi) {
+        let scale = (1u << 9u) - 1u;
+        let mid = (lo + scale * hi) >> 9u;
+        if (keys_shared[mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 3u && lo < hi) {
+        let scale = (1u << 7u) - 1u;
+        let mid = (lo + scale * hi) >> 7u;
+        if (keys_shared[mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 2u && lo < hi) {
+        let scale = (1u << 5u) - 1u;
+        let mid = (lo + scale * hi) >> 5u;
+        if (keys_shared[mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 1u && lo < hi) {
+        let scale = (1u << 4u) - 1u;
+        let mid = (lo + scale * hi) >> 4u;
+        if (keys_shared[mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+
+    while (lo < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (keys_shared[mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+
+    return lo;
+}
+
+fn lower_bound_local_b(b_start: u32, end_exclusive: u32, key: u32, levels: u32) -> u32 {
+    var lo: u32 = 0u;
+    var hi: u32 = end_exclusive;
+
+    if (levels >= 4u && lo < hi) {
+        let scale = (1u << 9u) - 1u;
+        let mid = (lo + scale * hi) >> 9u;
+        if (keys_shared[b_start + mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 3u && lo < hi) {
+        let scale = (1u << 7u) - 1u;
+        let mid = (lo + scale * hi) >> 7u;
+        if (keys_shared[b_start + mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 2u && lo < hi) {
+        let scale = (1u << 5u) - 1u;
+        let mid = (lo + scale * hi) >> 5u;
+        if (keys_shared[b_start + mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    if (levels >= 1u && lo < hi) {
+        let scale = (1u << 4u) - 1u;
+        let mid = (lo + scale * hi) >> 4u;
+        if (keys_shared[b_start + mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+
+    while (lo < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (keys_shared[b_start + mid] < key) { lo = mid + 1u; } else { hi = mid; }
+    }
+
+    return lo;
+}
+
+fn upper_bound_local_b(b_start: u32, range_begin: u32, range_end: u32, key: u32) -> u32 {
+    var lo: u32 = range_begin;
+    var hi: u32 = range_end;
+    while (lo < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (keys_shared[b_start + mid] <= key) { lo = mid + 1u; } else { hi = mid; }
+    }
+    return lo;
+}
+
+fn merge_path_local(a_count: u32, b_start: u32, b_count: u32, diag: u32) -> u32 {
+    var lo: u32 = select(0u, diag - b_count, diag > b_count);
+    var hi: u32 = min(diag, a_count);
+
+    while (lo < hi) {
+        let mid = (lo + hi) >> 1u;
+        let a_key = keys_shared[mid];
+        let b_key = keys_shared[b_start + diag - 1u - mid];
+        if (a_key <= b_key) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return lo;
+}
+
+fn balanced_path_local_biased(
+    a_count: u32,
+    b_start: u32,
+    b_count: u32,
+    diag: i32
+) -> vec2<u32> {
+    let diag_u = u32(max(0, diag));
+
+    if (diag_u == 0u) {
+        return vec2<u32>(0u, 0u);
+    }
+    if (diag_u >= a_count + b_count) {
+        return vec2<u32>(a_count, 0u);
+    }
+
+    let p = merge_path_local(a_count, b_start, b_count, diag_u);
+
+    var a_index = p;
+    var b_index = diag_u - p;
+    var star: u32 = 0u;
+
+    if (b_index < b_count) {
+        let x = keys_shared[b_start + b_index];
+        let levels = get_local_biased_levels(VT);
+        let a_start = lower_bound_local_a(a_index, x, levels);
+        let b_start_run = lower_bound_local_b(b_start, b_index, x, levels);
+        let a_run = a_index - a_start;
+        let b_run = b_index - b_start_run;
+        let x_count = a_run + b_run;
+        var b_advance = max(x_count >> 1u, x_count - a_run);
+        var b_end_hint = min(b_count, b_start_run + b_advance + 1u);
+        b_end_hint = max(b_end_hint, min(b_count, b_index + 1u));
+        let b_run_end = upper_bound_local_b(b_start, b_index, b_end_hint, x);
+        let actual_b_run = b_run_end - b_start_run;
+        b_advance = min(b_advance, actual_b_run);
+        let a_advance = x_count - b_advance;
+
+        let round_up = (a_advance == b_advance + 1u) && (b_advance < actual_b_run);
+        star = select(0u, 1u, round_up);
+
+        a_index = a_start + a_advance;
+    }
+
+    return vec2<u32>(a_index, star);
+}
+
+// ============================================================================
+// Serial Set Symmetric Difference
+//
+// Emit when A != B (XOR condition)
+// - pA (A < B): emit A, advance A only
+// - pB (B < A): emit B, advance B only
+// - equal (!pA && !pB): advance both, no emit
+// ============================================================================
+fn serial_set_sym_difference(
+    a_begin: u32,
+    a_end: u32,
+    b_begin: u32,
+    b_end: u32,
+    star: u32,
+    b_adjust: u32,
+    extended: bool,
+    results: ptr<function, array<u32, 7>>,
+    indices: ptr<function, array<u32, 7>>
+) -> u32 {
+    var commit: u32 = 0u;
+    var a_idx = a_begin;
+    var b_idx = b_begin;
+
+    var end_diag = i32(a_begin) + i32(b_begin) + i32(VT) - i32(star) - i32(b_adjust);
+    if (!extended) {
+        end_diag = min(end_diag, i32(a_end) + i32(b_end));
+    }
+
+    let min_iterations = VT / 2u;
+
+    for (var i: u32 = 0u; i < VT; i++) {
+        var test: bool;
+        if (extended) {
+            test = (i < min_iterations) || (i32(a_idx) + i32(b_idx) < end_diag);
+        } else {
+            test = (i32(a_idx) + i32(b_idx) < end_diag);
+        }
+
+        if (!test) {
+            break;
+        }
+
+        let a_key = keys_shared[a_idx];
+        let b_key = keys_shared[b_idx];
+
+        var pA: bool = false;
+        var pB: bool = false;
+        if (!extended && a_idx >= a_end) {
+            // A exhausted: output B and advance B
+            pB = true;
+        } else if (!extended && b_idx >= b_end) {
+            // B exhausted: output A and advance A
+            pA = true;
+        } else {
+            // Both are in range
+            pA = a_key < b_key;
+            pB = b_key < a_key;
+        }
+
+        // Output: if pA, output A; else output B
+        if (pA) {
+            (*results)[i] = a_key;
+            (*indices)[i] = a_idx;
+        } else {
+            (*results)[i] = b_key;
+            (*indices)[i] = b_idx;
+        }
+
+        // Advance pointers (ModernGPU style)
+        if (!pB) { a_idx++; }
+        if (!pA) { b_idx++; }
+
+        // Symmetric difference: commit when pA != pB (exactly one is true)
+        if (pA != pB) {
+            commit |= (1u << i);
+        }
+    }
+
+    return commit;
+}
+
+// ============================================================================
+// Workgroup Exclusive Scan with Total
+// ============================================================================
+fn workgroup_exclusive_scan_with_total(tid: u32, value: u32, total_ptr: ptr<function, u32>) -> u32 {
+    shared_scan[tid] = value;
+    workgroupBarrier();
+
+    for (var offset: u32 = 1u; offset < NT; offset *= 2u) {
+        var temp: u32 = 0u;
+        if (tid >= offset) {
+            temp = shared_scan[tid - offset];
+        }
+        workgroupBarrier();
+        shared_scan[tid] += temp;
+        workgroupBarrier();
+    }
+
+    *total_ptr = shared_scan[NT - 1u];
+
+    if (tid == 0u) {
+        return 0u;
+    } else {
+        return shared_scan[tid - 1u];
+    }
+}
+
+// ============================================================================
+// Decoupled Lookback
+// ============================================================================
+fn decoupled_lookback(wg_id: u32, local_total: u32) -> u32 {
+    var exclusive_prefix: u32 = 0u;
+
+    if (wg_id == 0u) {
+        atomicStore(&state[0u], pack_state(STATUS_INCLUSIVE, local_total));
+        return 0u;
+    }
+
+    atomicStore(&state[wg_id], pack_state(STATUS_PARTIAL, local_total));
+
+    var lookback_id: i32 = i32(wg_id) - 1;
+    var running_sum: u32 = 0u;
+
+    while (lookback_id >= 0) {
+        var predecessor_state: u32;
+        loop {
+            predecessor_state = atomicLoad(&state[u32(lookback_id)]);
+            let flag = unpack_flag(predecessor_state);
+            if (flag != STATUS_NOT_READY) {
+                break;
+            }
+        }
+
+        let flag = unpack_flag(predecessor_state);
+        let value = unpack_value(predecessor_state);
+
+        if (flag == STATUS_INCLUSIVE) {
+            running_sum += value;
+            break;
+        } else {
+            running_sum += value;
+            lookback_id -= 1;
+        }
+    }
+
+    exclusive_prefix = running_sum;
+
+    let inclusive_value = exclusive_prefix + local_total;
+    atomicStore(&state[wg_id], pack_state(STATUS_INCLUSIVE, inclusive_value));
+
+    return exclusive_prefix;
+}
+
+// ============================================================================
+// Main Kernel
+// ============================================================================
+@compute @workgroup_size(256)
+fn sym_difference_decoupled_lookback(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>
+) {
+    let tid = local_id.x;
+    let block = get_workgroup_index(wg_id);
+
+    if (block >= num_wg_total) {
+        return;
+    }
+
+    // ========================================================================
+    // Step 1: Read partition boundaries from DPI (thread 0)
+    // ========================================================================
+    if (tid == 0u) {
+        let bp0 = dpi[block];
+        let bp1 = dpi[block + 1u];
+
+        let a0 = bp0 & INDEX_MASK;
+        let a1 = bp1 & INDEX_MASK;
+
+        let bit0 = select(0u, 1u, (bp0 & STAR_MASK) != 0u);
+        let bit1 = select(0u, 1u, (bp1 & STAR_MASK) != 0u);
+
+        let b0 = dpi[num_wg_total + 1u + block] + bit0;
+        let b1 = dpi[num_wg_total + 1u + block + 1u] + bit1;
+
+        let a_count2 = a1 - a0;
+        let b_count2 = b1 - b0;
+        let extended = (a1 < a_length) && (b1 < b_length);
+        let b_start = a_count2 + select(0u, 1u, extended);
+
+        wg_a0 = a0;
+        wg_a1 = a1;
+        wg_b0 = b0;
+        wg_b1 = b1;
+        wg_a_count = a_count2;
+        wg_b_count = b_count2;
+        wg_b_start = b_start;
+        wg_extended = extended;
+        wg_bit0 = bit0;
+    }
+    workgroupBarrier();
+
+    let a0 = wg_a0;
+    let b0 = wg_b0;
+    let a_count2 = wg_a_count;
+    let b_count2 = wg_b_count;
+    let b_start = wg_b_start;
+    let extended = wg_extended;
+    let bit0 = wg_bit0;
+
+    // ========================================================================
+    // Step 2: Load data into shared memory
+    // ========================================================================
+    let a_load_count = a_count2 + select(0u, 1u, extended);
+    let b_load_count = b_count2 + select(0u, 1u, extended);
+
+    device_load_2_to_shared(tid, a0, a_load_count, b0, b_load_count, b_start);
+    workgroupBarrier();
+
+    // ========================================================================
+    // Step 3: Each thread finds its starting position using Local BalancedPath
+    // ========================================================================
+    let partition_size = a_count2 + b_count2;
+    let diag_start = i32(VT * tid) - i32(bit0);
+    let diag = min(diag_start, i32(partition_size));
+
+    let bp = balanced_path_local_biased(a_count2, b_start, b_count2, diag);
+
+    let a0tid = bp.x;
+    let star = bp.y;
+    let b0tid_true = i32(VT * tid) + i32(star) - i32(a0tid) - i32(bit0);
+    let b_adjust = u32(max(0, -b0tid_true));
+    let b0tid = u32(max(0, b0tid_true));
+
+    // ========================================================================
+    // Step 4: Serial set symmetric difference
+    // ========================================================================
+    var results: array<u32, 7>;
+    var indices: array<u32, 7>;
+
+    let commit = serial_set_sym_difference(
+        a0tid,
+        a_count2,
+        b_start + b0tid,
+        b_start + b_count2,
+        star,
+        b_adjust,
+        extended,
+        &results,
+        &indices
+    );
+
+    // ========================================================================
+    // Step 5: Workgroup-level exclusive scan to get local offsets and total
+    // ========================================================================
+    let local_count = countOneBits(commit);
+    var wg_total: u32 = 0u;
+    let local_offset = workgroup_exclusive_scan_with_total(tid, local_count, &wg_total);
+
+    // ========================================================================
+    // Step 6: Thread 0 performs Decoupled Lookback
+    // ========================================================================
+    if (tid == 0u) {
+        wg_local_total = wg_total;
+        wg_exclusive_prefix = decoupled_lookback(block, wg_total);
+
+        if (block == num_wg_total - 1u) {
+            atomicStore(&total_count[0], wg_exclusive_prefix + wg_total);
+        }
+    }
+    workgroupBarrier();
+
+    // ========================================================================
+    // Step 7: Scatter results to output
+    // ========================================================================
+    let global_offset = wg_exclusive_prefix + local_offset;
+
+    var write_pos = global_offset;
+    for (var i: u32 = 0u; i < VT; i++) {
+        if ((commit & (1u << i)) != 0u) {
+            output[write_pos] = results[i];
+            write_pos++;
+        }
+    }
+}

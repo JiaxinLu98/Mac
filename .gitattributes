@@ -1,0 +1,8 @@
+# The Mac side runs shell scripts, so every text file keeps LF endings on checkout.
+* text=auto eol=lf
+
+# Datasets and binaries are never converted.
+*.dat binary
+*.bin binary
+*.png binary
+*.jpg binary

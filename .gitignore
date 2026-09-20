@@ -1,0 +1,19 @@
+# Build outputs
+build*/
+dist/
+node_modules/
+*.o
+*.exe
+
+# Generated micro-benchmark arrays (2-4 GB, created by apple_upload/gen_micro_data_mac.sh)
+public/data/
+
+# Datasets fetched on the Mac (scripts/download_fimi.sh)
+public/fimi/
+eclat_cpp/data/
+
+# Experiment logs
+apple_logs/
+
+# macOS
+.DS_Store
