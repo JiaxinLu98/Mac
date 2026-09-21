@@ -12,6 +12,9 @@
 #   RANGE   value range for fusion (default: e2, the range of the fusion table)
 #   OUT     log directory (default: apple_logs)
 #   PORT    dev server port (default: 8080)
+#   TIMEOUT seconds to wait for the end marker (default: 3600)
+#   EXTRA   extra URL parameters, e.g. "&ph=1000&lbmax=4096" (Lookback dispatch scheme: lb=split|2d, lbmax=<n>)
+#   TAG     suffix for the log name, so variants do not overwrite each other
 # The dev server serves public/ at the site root, so the data files must be in public/data
 # (bash apple_upload/gen_micro_data_mac.sh "e2 e6").
 set -euo pipefail
@@ -47,7 +50,8 @@ if [ "$APP" = "eclat" ]; then
     done
 fi
 
-log="$OUT/m5pro_chrome_${APP}_$DATE.log"
+URL="$URL${EXTRA:-}"
+log="$OUT/m5pro_chrome_${APP}${TAG:+_$TAG}_$DATE.log"
 serverLog="$OUT/m5pro_devserver_$DATE.log"
 (cd "$ROOT" && npm run serve -- --port "$PORT" > "$serverLog" 2>&1) &
 serverPid=$!
@@ -61,13 +65,28 @@ done
 
 profile="$(mktemp -d)"
 echo "=== $APP -> $(basename "$log")"
+# No --virtual-time-budget: under virtual time requestDevice() never resolves (Chrome 153, M5 Pro). Headless Chrome
+# does not exit on its own either, so it runs in the background until the page prints its end marker
+# ([bench-done], or [eclat-done] for ECLAT) or TIMEOUT seconds pass.
 "$CHROME" --headless=new --disable-gpu-sandbox --enable-unsafe-webgpu \
-    --user-data-dir="$profile" --virtual-time-budget=1800000 \
-    --enable-logging=stderr --v=0 "$URL" > "$log" 2>&1 || true
+    --user-data-dir="$profile" \
+    --enable-logging=stderr --v=0 "$URL" > "$log" 2>&1 &
+chromePid=$!
+# npm leaves the webpack node process behind when its shell is killed, so the listener on the port is stopped too.
+trap 'kill $chromePid $serverPid $(lsof -ti tcp:$PORT -sTCP:LISTEN) 2>/dev/null || true' EXIT
+waited=0
+until grep -q -E 'bench-done|eclat-done' "$log" 2>/dev/null; do
+    kill -0 "$chromePid" 2>/dev/null || break
+    [ "$waited" -ge "${TIMEOUT:-3600}" ] && { echo "  timed out after ${TIMEOUT:-3600}s"; break; }
+    sleep 2; waited=$((waited + 2))
+done
+kill "$chromePid" 2>/dev/null || true
+wait "$chromePid" 2>/dev/null || true
 rm -rf "$profile"
 
 echo "  $(grep -c "$MARK" "$log" || true) result lines in $(basename "$log")"
-if ! grep -q 'bench-done' "$log"; then
+if ! grep -q -E 'bench-done|eclat-done' "$log"; then
     echo "  [bench-done] not found. Headless Chrome may not expose WebGPU on this machine."
     echo "  Run it by hand instead: npm run serve, then open $URL in Chrome and copy the console output."
+    exit 1
 fi
