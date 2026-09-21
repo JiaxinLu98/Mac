@@ -17,6 +17,41 @@ export const VT = 12;
 export const NV = NT * VT;  // 3072
 export const DPI_WG_SIZE = 256;
 
+/**
+ * How the Lookback workgroups are dispatched.
+ *   'split' (default): consecutive 1-D dispatches of at most maxWgPerDispatch workgroups in one compute pass,
+ *                      each with its own wg_base. Needed on Apple Metal, where a 2-D dispatch of the spin-waiting
+ *                      Lookback kernel never makes forward progress (GPU hang on the M4 Pro and the M5 Pro).
+ *   '2d':              one 2-D dispatch, the original scheme. Do not use on Apple GPUs.
+ * URL: ?lb=split|2d and ?lbmax=<workgroups per dispatch> (default 65535; smaller values force a split at
+ * sizes that would fit one dispatch, to measure what each extra dispatch costs).
+ */
+export interface LookbackDispatchOptions {
+    mode: 'split' | '2d';
+    maxWgPerDispatch: number;
+}
+
+export function lookbackDispatchOptionsFromUrl(): LookbackDispatchOptions {
+    const params = new URLSearchParams(typeof location === 'undefined' ? '' : location.search);
+    const lbmax = parseInt(params.get('lbmax') ?? `${MAXWORKGROUP}`, 10);
+    return {
+        mode: params.get('lb') === '2d' ? '2d' : 'split',
+        maxWgPerDispatch: Math.min(Math.max(1, lbmax || MAXWORKGROUP), MAXWORKGROUP),
+    };
+}
+
+/** The Lookback dispatches for numWg workgroups: first workgroup index and grid of each. */
+export function planLookbackDispatches(numWg: number, options: LookbackDispatchOptions): { base: number, x: number, y: number }[] {
+    if (options.mode === '2d') {
+        return [{ base: 0, x: Math.min(numWg, MAXWORKGROUP), y: Math.ceil(numWg / MAXWORKGROUP) }];
+    }
+    const plan = [];
+    for (let base = 0; base < numWg; base += options.maxWgPerDispatch) {
+        plan.push({ base, x: Math.min(options.maxWgPerDispatch, numWg - base), y: 1 });
+    }
+    return plan;
+}
+
 /** Max possible output size for each operation. */
 export function getMaxOutputSize(opMode: number, aLen: number, bLen: number): number {
     switch (opMode) {
@@ -41,6 +76,11 @@ export class TwoPhasePipelineTester {
     private diagBindGroupLayout: GPUBindGroupLayout;
     private lookbackPipeline: GPUComputePipeline;
     private lookbackBindGroupLayout: GPUBindGroupLayout;
+
+    /** Lookback dispatch scheme, from ?lb= and ?lbmax= unless the caller overrides it. */
+    public lookbackDispatch: LookbackDispatchOptions = lookbackDispatchOptionsFromUrl();
+    /** Number of Lookback dispatches of the last run. */
+    public lastLookbackDispatches = 0;
 
     constructor(device: GPUDevice, timestampQueryManager: TimestampQueryManager, label: string, opMode: number) {
         this.device = device;
@@ -72,7 +112,7 @@ export class TwoPhasePipelineTester {
             }
         });
 
-        // Lookback bind group layout (9 bindings)
+        // Lookback bind group layout (10 bindings)
         this.lookbackBindGroupLayout = device.createBindGroupLayout({
             label: `${label} Decoupled Lookback bind group layout`,
             entries: [
@@ -85,6 +125,7 @@ export class TwoPhasePipelineTester {
                 { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // a_length
                 { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // b_length
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // num_wg_total
+                { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // wg_base
             ]
         });
 
@@ -116,6 +157,7 @@ export class TwoPhasePipelineTester {
             lookbackMs: number[];
             kernelMs: number[];
             spanMs: number[];
+            hostMs: number[];
         };
     }> {
         const device = this.device;
@@ -127,7 +169,7 @@ export class TwoPhasePipelineTester {
             return {
                 totalCount: 0,
                 timing: { dpiMs: 0, lookbackMs: 0, totalMs: 0 },
-                runs: { dpiMs: [], lookbackMs: [], kernelMs: [], spanMs: [] }
+                runs: { dpiMs: [], lookbackMs: [], kernelMs: [], spanMs: [], hostMs: [] }
             };
         }
 
@@ -189,23 +231,38 @@ export class TwoPhasePipelineTester {
             ]
         });
 
-        const lookbackBindGroup = device.createBindGroup({
-            layout: this.lookbackBindGroupLayout,
-            entries: [
-                { binding: 0, resource: { buffer: bufferA } },
-                { binding: 1, resource: { buffer: bufferB } },
-                { binding: 2, resource: { buffer: bufferDPI } },
-                { binding: 3, resource: { buffer: bufferState } },
-                { binding: 4, resource: { buffer: bufferOutput } },
-                { binding: 5, resource: { buffer: bufferTotalCount } },
-                { binding: 6, resource: { buffer: bufferALen } },
-                { binding: 7, resource: { buffer: bufferBLen } },
-                { binding: 8, resource: { buffer: bufferNumWg } },
-            ]
+        // One bind group per Lookback dispatch: they differ in wg_base only.
+        const lookbackPlan = planLookbackDispatches(numWg, this.lookbackDispatch);
+        this.lastLookbackDispatches = lookbackPlan.length;
+        const wgBaseBuffers: GPUBuffer[] = [];
+        const lookbackDispatches = lookbackPlan.map(({ base, x, y }) => {
+            const bufferWgBase = device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(bufferWgBase, 0, new Uint32Array([base]));
+            wgBaseBuffers.push(bufferWgBase);
+            const bindGroup = device.createBindGroup({
+                layout: this.lookbackBindGroupLayout,
+                entries: [
+                    { binding: 0, resource: { buffer: bufferA } },
+                    { binding: 1, resource: { buffer: bufferB } },
+                    { binding: 2, resource: { buffer: bufferDPI } },
+                    { binding: 3, resource: { buffer: bufferState } },
+                    { binding: 4, resource: { buffer: bufferOutput } },
+                    { binding: 5, resource: { buffer: bufferTotalCount } },
+                    { binding: 6, resource: { buffer: bufferALen } },
+                    { binding: 7, resource: { buffer: bufferBLen } },
+                    { binding: 8, resource: { buffer: bufferNumWg } },
+                    { binding: 9, resource: { buffer: bufferWgBase } },
+                ]
+            });
+            return { bindGroup, x, y };
         });
-
-        const dispatchX = Math.min(numWg, MAXWORKGROUP);
-        const dispatchY = Math.ceil(numWg / MAXWORKGROUP);
+        const encodeLookback = (pass: GPUComputePassEncoder) => {
+            pass.setPipeline(this.lookbackPipeline);
+            for (const d of lookbackDispatches) {
+                pass.setBindGroup(0, d.bindGroup);
+                pass.dispatchWorkgroups(d.x, d.y);
+            }
+        };
 
         const subgroupSize = (device.adapterInfo as any)?.subgroupSize || 32;
         const subgroupsPerWg = DPI_WG_SIZE / subgroupSize;
@@ -232,9 +289,7 @@ export class TwoPhasePipelineTester {
             pass.end();
 
             pass = encoder.beginComputePass();
-            pass.setPipeline(this.lookbackPipeline);
-            pass.setBindGroup(0, lookbackBindGroup);
-            pass.dispatchWorkgroups(dispatchX, dispatchY);
+            encodeLookback(pass);
             pass.end();
 
             device.queue.submit([encoder.finish()]);
@@ -245,11 +300,13 @@ export class TwoPhasePipelineTester {
         const dpiTimes: number[] = [];
         const lookbackTimes: number[] = [];
         const totalTimes: number[] = [];
+        const hostTimes: number[] = [];  // host wall clock: encode + submit + wait for the GPU
 
         for (let iter = 0; iter < iterations; iter++) {
             device.queue.writeBuffer(bufferState, 0, new Uint32Array(numWg).fill(0));
             device.queue.writeBuffer(bufferTotalCount, 0, new Uint32Array([0]));
 
+            const hostStart = performance.now();
             const encoder = device.createCommandEncoder();
 
             let pass = encoder.beginComputePass(
@@ -263,14 +320,13 @@ export class TwoPhasePipelineTester {
             pass = encoder.beginComputePass(
                 this.timestampQueryManager.createComputePassDescriptor(2, 3)
             );
-            pass.setPipeline(this.lookbackPipeline);
-            pass.setBindGroup(0, lookbackBindGroup);
-            pass.dispatchWorkgroups(dispatchX, dispatchY);
+            encodeLookback(pass);
             pass.end();
 
             this.timestampQueryManager.resolve(encoder);
             device.queue.submit([encoder.finish()]);
             await device.queue.onSubmittedWorkDone();
+            hostTimes.push(performance.now() - hostStart);
 
             const timestamps = await this.timestampQueryManager.downloadTimestampResult();
 
@@ -320,6 +376,7 @@ export class TwoPhasePipelineTester {
         bufferALen.destroy();
         bufferBLen.destroy();
         bufferNumWg.destroy();
+        wgBaseBuffers.forEach(b => b.destroy());
         bufferDPI.destroy();
         bufferState.destroy();
         bufferOutput.destroy();
@@ -340,6 +397,7 @@ export class TwoPhasePipelineTester {
                 lookbackMs: lookbackTimes,
                 kernelMs: dpiTimes.map((d, i) => d + lookbackTimes[i]),
                 spanMs: totalTimes,
+                hostMs: hostTimes,
             }
         };
     }

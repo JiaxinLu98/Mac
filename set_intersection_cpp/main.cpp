@@ -84,6 +84,18 @@ static std::vector<uint32_t> cpuSetIntersection(const std::vector<uint32_t>& a,
     return result;
 }
 
+// Size of the intersection only, for inputs too large to keep a second copy of the result.
+static uint32_t cpuSetIntersectionCount(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    uint32_t count = 0;
+    size_t ai = 0, bi = 0;
+    while (ai < a.size() && bi < b.size()) {
+        if (a[ai] < b[bi])      ++ai;
+        else if (a[ai] > b[bi]) ++bi;
+        else { ++count; ++ai; ++bi; }
+    }
+    return count;
+}
+
 // ---------------------------------------------------------------------------
 // Global state for async callbacks
 // ---------------------------------------------------------------------------
@@ -193,6 +205,79 @@ static WGPUBufferMapCallbackInfo mapCallbackInfo() {
 // ---------------------------------------------------------------------------
 // Run a single test case
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Lookback dispatch scheme.
+//   split (default): consecutive 1-D dispatches of at most g_lbMaxWg workgroups in one compute pass, each with
+//                    its own wg_base. Needed on Apple Metal, where a 2-D dispatch of the spin-waiting Lookback
+//                    kernel never makes forward progress (GPU hang on the M4 Pro and the M5 Pro at 128M).
+//   2d:              one 2-D dispatch, the original scheme. Do not use on Apple GPUs.
+// MICRO_LB_MODE=split|2d, MICRO_LB_MAX=<workgroups per dispatch> (default 65535; smaller values force a split
+// at sizes that fit one dispatch, to measure what each extra dispatch costs).
+// ---------------------------------------------------------------------------
+static bool     g_lbSplit = true;
+static uint32_t g_lbMaxWg = 65535;
+
+struct LookbackDispatch {
+    uint32_t x, y;
+    WGPUBuffer baseBuf;
+    WGPUBindGroup bindGroup;
+};
+
+// entries holds bindings 0-8, shared by every dispatch. Binding 9 (wg_base) is added per dispatch.
+static std::vector<LookbackDispatch> makeLookbackDispatches(
+    WGPUDevice device, WGPUQueue queue, WGPUBindGroupLayout lookbackBGL,
+    const WGPUBindGroupEntry* entries, uint32_t numWg)
+{
+    std::vector<LookbackDispatch> plan;
+    const uint32_t step = g_lbSplit ? g_lbMaxWg : numWg;
+    for (uint32_t base = 0; base < numWg; base += step) {
+        LookbackDispatch d{};
+        const uint32_t count = std::min(step, numWg - base);
+        d.x = std::min(count, (uint32_t)65535);
+        d.y = (count + 65535 - 1) / 65535;
+
+        WGPUBufferDescriptor desc{};
+        desc.label = wgpuStr("wgBase");
+        desc.size = 4;
+        desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+        d.baseBuf = wgpuDeviceCreateBuffer(device, &desc);
+        wgpuQueueWriteBuffer(queue, d.baseBuf, 0, &base, 4);
+
+        WGPUBindGroupEntry all[10];
+        for (int i = 0; i < 9; i++) all[i] = entries[i];
+        all[9] = WGPUBindGroupEntry{};
+        all[9].binding = 9;
+        all[9].buffer = d.baseBuf;
+        all[9].offset = 0;
+        all[9].size = 4;
+        WGPUBindGroupDescriptor bgd{};
+        bgd.label = wgpuStr("LB BG");
+        bgd.layout = lookbackBGL;
+        bgd.entryCount = 10;
+        bgd.entries = all;
+        d.bindGroup = wgpuDeviceCreateBindGroup(device, &bgd);
+        plan.push_back(d);
+    }
+    return plan;
+}
+
+static void encodeLookback(WGPUComputePassEncoder pass, WGPUComputePipeline pipeline,
+                           const std::vector<LookbackDispatch>& plan) {
+    wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    for (const auto& d : plan) {
+        wgpuComputePassEncoderSetBindGroup(pass, 0, d.bindGroup, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, d.x, d.y, 1);
+    }
+}
+
+static void releaseLookbackDispatches(std::vector<LookbackDispatch>& plan) {
+    for (auto& d : plan) {
+        wgpuBindGroupRelease(d.bindGroup);
+        wgpuBufferRelease(d.baseBuf);
+    }
+    plan.clear();
+}
+
 struct TestResult {
     bool passed;
     uint32_t gpuCount;
@@ -226,12 +311,10 @@ static TestResult runIntersection(
     const uint32_t dpiDispatchY = (dpiBlocks + MAX_DISPATCH_X - 1) / MAX_DISPATCH_X;
 
     // Lookback dispatch: unchanged, one workgroup per partition
-    const uint32_t lbDispatchX = std::min(numWg, MAX_DISPATCH_X);
-    const uint32_t lbDispatchY = (numWg + MAX_DISPATCH_X - 1) / MAX_DISPATCH_X;
 
     if (verbose) {
-        printf("  |A|=%u  |B|=%u  numWg=%u  dpiDispatch=(%u,%u)  lbDispatch=(%u,%u)\n",
-               a_len, b_len, numWg, dpiDispatchX, dpiDispatchY, lbDispatchX, lbDispatchY);
+        printf("  |A|=%u  |B|=%u  numWg=%u  dpiDispatch=(%u,%u)  lookback=%s, at most %u workgroups per dispatch\n",
+               a_len, b_len, numWg, dpiDispatchX, dpiDispatchY, g_lbSplit ? "split" : "2d", g_lbMaxWg);
     }
 
     // ---- Create buffers ----
@@ -296,12 +379,7 @@ static TestResult runIntersection(
         bufEntry(3, bufState), bufEntry(4, bufOutput), bufEntry(5, bufTotalCnt),
         bufEntry(6, bufALen), bufEntry(7, bufBLen), bufEntry(8, bufNumWg),
     };
-    WGPUBindGroupDescriptor lbBGD{};
-    lbBGD.label = wgpuStr("LB BG");
-    lbBGD.layout = lookbackBGL;
-    lbBGD.entryCount = 9;
-    lbBGD.entries = lbEntries;
-    WGPUBindGroup lbBG = wgpuDeviceCreateBindGroup(device, &lbBGD);
+    auto lbPlan = makeLookbackDispatches(device, queue, lookbackBGL, lbEntries, numWg);
 
     // ---- Encode & dispatch ----
     WGPUCommandEncoderDescriptor encDesc{};
@@ -322,9 +400,7 @@ static TestResult runIntersection(
     {
         WGPUComputePassDescriptor cpd{};
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &cpd);
-        wgpuComputePassEncoderSetPipeline(pass, lookbackPipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, lbBG, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, lbDispatchX, lbDispatchY, 1);
+        encodeLookback(pass, lookbackPipeline, lbPlan);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
@@ -413,7 +489,7 @@ static TestResult runIntersection(
 
     // ---- Cleanup ----
     wgpuBindGroupRelease(diagBG);
-    wgpuBindGroupRelease(lbBG);
+    releaseLookbackDispatches(lbPlan);
     wgpuBufferRelease(bufA);
     wgpuBufferRelease(bufB);
     wgpuBufferRelease(bufALen);
@@ -529,6 +605,7 @@ struct BenchmarkTiming {
     // DPI pass to the end of the Lookback pass.
     std::vector<double> dpi, lookback, kernel, span;
     uint32_t count = 0;  // total_count of the last run, checked against the CPU reference
+    uint32_t lookbackDispatches = 0;
 };
 
 static BenchmarkTiming runBenchmark(
@@ -552,8 +629,6 @@ static BenchmarkTiming runBenchmark(
     const uint32_t dpiDispatchY = (dpiBlocks + MAX_DISPATCH_X - 1) / MAX_DISPATCH_X;
 
     // Lookback dispatch (unchanged)
-    const uint32_t lbDispatchX = std::min(numWg, MAX_DISPATCH_X);
-    const uint32_t lbDispatchY = (numWg + MAX_DISPATCH_X - 1) / MAX_DISPATCH_X;
 
     // ---- Create buffers ----
     auto makeBuf = [&](const char* label, uint64_t size, WGPUBufferUsage usage) {
@@ -607,12 +682,9 @@ static BenchmarkTiming runBenchmark(
         bufEntry(3, bufState), bufEntry(4, bufOutput), bufEntry(5, bufTotalCnt),
         bufEntry(6, bufALen), bufEntry(7, bufBLen), bufEntry(8, bufNumWg),
     };
-    WGPUBindGroupDescriptor lbBGD{};
-    lbBGD.label = wgpuStr("LB BG");
-    lbBGD.layout = lookbackBGL;
-    lbBGD.entryCount = 9;
-    lbBGD.entries = lbEntries;
-    WGPUBindGroup lbBG = wgpuDeviceCreateBindGroup(device, &lbBGD);
+    auto lbPlan = makeLookbackDispatches(device, queue, lookbackBGL, lbEntries, numWg);
+
+    const uint32_t lbDispatchCount = (uint32_t)lbPlan.size();
 
     // ---- Timestamp query resources ----
     WGPUQuerySetDescriptor qsDesc{};
@@ -680,9 +752,7 @@ static BenchmarkTiming runBenchmark(
             WGPUComputePassDescriptor cpd{};
             cpd.timestampWrites = &tsWrites;
             WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &cpd);
-            wgpuComputePassEncoderSetPipeline(pass, lookbackPipeline);
-            wgpuComputePassEncoderSetBindGroup(pass, 0, lbBG, 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(pass, lbDispatchX, lbDispatchY, 1);
+            encodeLookback(pass, lookbackPipeline, lbPlan);
             wgpuComputePassEncoderEnd(pass);
             wgpuComputePassEncoderRelease(pass);
         }
@@ -749,7 +819,7 @@ static BenchmarkTiming runBenchmark(
     wgpuQuerySetDestroy(querySet);
     wgpuQuerySetRelease(querySet);
     wgpuBindGroupRelease(diagBG);
-    wgpuBindGroupRelease(lbBG);
+    releaseLookbackDispatches(lbPlan);
     wgpuBufferRelease(bufA);
     wgpuBufferRelease(bufB);
     wgpuBufferRelease(bufALen);
@@ -767,7 +837,7 @@ static BenchmarkTiming runBenchmark(
         lookbackSum / measuredIters,
         totalSum    / measuredIters,
         dpiRuns, lookbackRuns, kernelRuns, spanRuns,
-        resultCount
+        resultCount, lbDispatchCount
     };
 }
 
@@ -779,6 +849,13 @@ static BenchmarkTiming runBenchmark(
 int main(int argc, char** argv) {
     printf("=== Set Intersection (Balanced Path + Decoupled Lookback) ===\n");
     printf("=== C++ host, backend: %s (subgroup-optimized DPI) ===\n\n", kImplName);
+
+    if (const char* mode = getenv("MICRO_LB_MODE")) g_lbSplit = strcmp(mode, "2d") != 0;
+    if (const char* maxWg = getenv("MICRO_LB_MAX")) {
+        const long v = atol(maxWg);
+        if (v >= 1 && v <= 65535) g_lbMaxWg = (uint32_t)v;
+    }
+    printf("Lookback dispatch: %s, at most %u workgroups per dispatch\n\n", g_lbSplit ? "split (1-D)" : "2d", g_lbMaxWg);
 
     // ---- Instance ----
     WGPUInstanceDescriptor instDesc{};
@@ -971,10 +1048,11 @@ int main(int argc, char** argv) {
         bglEntry(6, WGPUBufferBindingType_Uniform),
         bglEntry(7, WGPUBufferBindingType_Uniform),
         bglEntry(8, WGPUBufferBindingType_Uniform),
+        bglEntry(9, WGPUBufferBindingType_Uniform),  // wg_base
     };
     WGPUBindGroupLayoutDescriptor lbBGLD{};
     lbBGLD.label = wgpuStr("Lookback BGL");
-    lbBGLD.entryCount = 9;
+    lbBGLD.entryCount = 10;
     lbBGLD.entries = lbLayoutEntries;
     WGPUBindGroupLayout lookbackBGL = wgpuDeviceCreateBindGroupLayout(g_device, &lbBGLD);
 
@@ -1087,10 +1165,7 @@ int main(int argc, char** argv) {
                                             lbPipeline, lookbackBGL,
                                             A, B, PREHEAT_MS, WARMUP, MEASURED);
 
-                const char* check = "skip";
-                if (A.size() <= 64000000 && B.size() <= 64000000) {
-                    check = cpuSetIntersection(A, B).size() == timing.count ? "PASS" : "FAIL";
-                }
+                const char* check = cpuSetIntersectionCount(A, B) == timing.count ? "PASS" : "FAIL";
                 printf("%-10s %12s  %10.3f  %10.3f  %10.3f  count %u %s\n",
                        dsName, inputStr,
                        timing.dpiMs, timing.lookbackMs, timing.totalMs, timing.count, check);
@@ -1105,8 +1180,9 @@ int main(int argc, char** argv) {
                     return out + "]";
                 };
                 printf("[micro-result] {\"impl\":\"%s\",\"op\":\"intersection\",\"dataset\":\"%s\",\"preheat_ms\":%.0f,"
-                       "\"warmup\":%d,\"runs\":%zu,\"count\":%u,\"check\":\"%s\",\"dpi_ms\":%s,\"lookback_ms\":%s,\"kernel_ms\":%s,\"span_ms\":%s}\n",
+                       "\"warmup\":%d,\"runs\":%zu,\"count\":%u,\"check\":\"%s\",\"lookback_mode\":\"%s\",\"lookback_dispatches\":%u,\"dpi_ms\":%s,\"lookback_ms\":%s,\"kernel_ms\":%s,\"span_ms\":%s}\n",
                        kImplName, dsName, PREHEAT_MS, WARMUP, timing.kernel.size(), timing.count, check,
+                       g_lbSplit ? "split" : "2d", timing.lookbackDispatches,
                        jsonArray(timing.dpi).c_str(), jsonArray(timing.lookback).c_str(),
                        jsonArray(timing.kernel).c_str(), jsonArray(timing.span).c_str());
             }

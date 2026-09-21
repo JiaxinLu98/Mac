@@ -22,6 +22,7 @@
 
 import TimestampQueryManager from '../../../TimestampQueryManager';
 import * as utils from '../../../utils';
+import { gpuPreheat } from '../../../gpu_preheat';
 import { setOpMode } from '../../../utils';
 import computeDiagonalsShader from '../balanced_path_biased.wgsl';
 import countShaderBase from '../set_availability_count.wgsl';
@@ -48,6 +49,8 @@ class FourPhasePipelineTester {
     private timestampQueryManager: TimestampQueryManager;
     // GPU span of every timed run of the last run() call (first pass start to last pass end)
     public lastTotalTimes: number[] = [];
+    /** Host wall clock of every timed run of the last run(): encode + submit + wait for the GPU. */
+    public lastHostTimes: number[] = [];
     // Per-phase GPU times of every timed run of the last run() call. Scan is the span minus
     // the Partition (DPI), Count and Write passes, so it also holds the gaps between passes.
     public lastPhaseTimes: { dpi: number[]; count: number[]; scan: number[]; write: number[] } =
@@ -355,8 +358,10 @@ class FourPhasePipelineTester {
         const scanTimes: number[] = [];
         const writeTimes: number[] = [];
         const totalTimes: number[] = [];
+        const hostTimes: number[] = [];  // host wall clock: encode + submit + wait for the GPU
 
         for (let iter = 0; iter < iterations; iter++) {
+            const hostStart = performance.now();
             const encoder = device.createCommandEncoder();
 
             let pass = encoder.beginComputePass(tsm.createComputePassDescriptor(0, 1));
@@ -383,6 +388,7 @@ class FourPhasePipelineTester {
             tsm.resolve(encoder);
             device.queue.submit([encoder.finish()]);
             await device.queue.onSubmittedWorkDone();
+            hostTimes.push(performance.now() - hostStart);
 
             const timestamps = await tsm.downloadTimestampResult();
 
@@ -403,6 +409,7 @@ class FourPhasePipelineTester {
 
         const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
         this.lastTotalTimes = totalTimes;
+        this.lastHostTimes = hostTimes;
         this.lastPhaseTimes = { dpi: dpiTimes, count: countTimes, scan: scanTimes, write: writeTimes };
 
         // Cleanup
@@ -556,7 +563,9 @@ export async function runUnifiedSingleOpTest(device: GPUDevice, opMode: number):
  * same inputs. Both are timed as the GPU span of the whole pipeline, from the start of its
  * first pass to the end of its last pass, recorded with timestamp queries. Every timed run
  * is printed in a [fusion-result] JSON line.
- * URL: ?app=fusion[&ops=0,2][&range=e2][&sizes=1,2,4,8,16,32,64,128][&w=10][&n=100]
+ * URL: ?app=fusion[&ops=0,2][&range=e2][&sizes=1,2,4,8,16,32,64,128][&w=10][&n=100][&ph=0]
+ *      [&lb=split|2d][&lbmax=65535]   (Lookback dispatch scheme of the 2-step pipeline, see two_phase_pipeline.ts)
+ * ph is the unrelated GPU work in ms before each pipeline of each size, as in the micro-benchmark.
  */
 export async function runFusionBenchmark(device: GPUDevice): Promise<void> {
     const params = new URLSearchParams(typeof location === 'undefined' ? '' : location.search);
@@ -565,6 +574,7 @@ export async function runFusionBenchmark(device: GPUDevice): Promise<void> {
     const sizes = (params.get('sizes') ?? '1,2,4,8,16,32,64,128').split(',');
     const NUM_WARMUP = parseInt(params.get('w') ?? '10', 10);
     const NUM_ITERATIONS = parseInt(params.get('n') ?? '100', 10);
+    const PREHEAT_MS = parseInt(params.get('ph') ?? '0', 10);
 
     const timestampQueryManager = new TimestampQueryManager(device, 16);
     if (!timestampQueryManager.timestampSupported) {
@@ -585,10 +595,12 @@ export async function runFusionBenchmark(device: GPUDevice): Promise<void> {
                 const aKeys = await utils.loadUint32ArrayFromBin(`./data/A_${size}${range}.bin`);
                 const bKeys = await utils.loadUint32ArrayFromBin(`./data/B_${size}${range}.bin`);
 
+                await gpuPreheat(device, PREHEAT_MS);
                 const fourResult = await fourPhaseTester.run(aKeys, bKeys, NUM_ITERATIONS, NUM_WARMUP);
                 const fourRuns = fourPhaseTester.lastTotalTimes;
                 const fourPhases = fourPhaseTester.lastPhaseTimes;
-                const twoResult = await twoPhaseTester.run(aKeys, bKeys, NUM_ITERATIONS, NUM_WARMUP);
+                const fourHost = fourPhaseTester.lastHostTimes;
+                const twoResult = await twoPhaseTester.run(aKeys, bKeys, NUM_ITERATIONS, NUM_WARMUP, PREHEAT_MS);
                 const twoRuns = twoResult.runs.spanMs;
 
                 let check = fourResult.totalCount === twoResult.totalCount ? 'match' : 'MISMATCH';
@@ -600,9 +612,13 @@ export async function runFusionBenchmark(device: GPUDevice): Promise<void> {
                 console.log(`  ${size}M${range}: 4-step ${mean(fourRuns).toFixed(3)} ms, 2-step ${mean(twoRuns).toFixed(3)} ms, ` +
                     `speedup ${(mean(fourRuns) / mean(twoRuns)).toFixed(2)}x, count ${twoResult.totalCount}, ${check}`);
                 console.log(`[fusion-result] ${JSON.stringify({
-                    op: opName, dataset: `${size}${range}`, warmup: NUM_WARMUP, runs: twoRuns.length,
-                    count: twoResult.totalCount, check, four_step_ms: fourRuns, two_step_ms: twoRuns,
+                    op: opName, dataset: `${size}${range}`, preheat_ms: PREHEAT_MS, warmup: NUM_WARMUP, runs: twoRuns.length,
+                    count: twoResult.totalCount, check,
+                    lookback_mode: twoPhaseTester.lookbackDispatch.mode, lookback_dispatches: twoPhaseTester.lastLookbackDispatches,
+                    four_step_ms: fourRuns, two_step_ms: twoRuns,
+                    four_step_host_ms: fourHost, two_step_host_ms: twoResult.runs.hostMs,
                     four_step_phases_ms: fourPhases,
+                    two_step_phases_ms: { dpi: twoResult.runs.dpiMs, lookback: twoResult.runs.lookbackMs },
                 })}`);
             } catch (e) {
                 console.log(`  ${size}M${range}: Error ${e}`);
@@ -680,6 +696,8 @@ export async function run2PhaseOnlyTest(device: GPUDevice, opMode: number, sizes
             console.log(`[micro-result] ${JSON.stringify({
                 impl: 'webgpu', op: opName, dataset: `${size}${range}`, preheat_ms: PREHEAT_MS, warmup: NUM_WARMUP,
                 runs: result.runs.kernelMs.length, count: result.totalCount, check: matchStr,
+                lookback_mode: twoPhaseTester.lookbackDispatch.mode, lookback_dispatches: twoPhaseTester.lastLookbackDispatches,
+                host_ms: result.runs.hostMs,
                 dpi_ms: result.runs.dpiMs, lookback_ms: result.runs.lookbackMs,
                 kernel_ms: result.runs.kernelMs, span_ms: result.runs.spanMs,
             })}`);

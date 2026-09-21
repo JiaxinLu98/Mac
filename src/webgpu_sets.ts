@@ -113,6 +113,7 @@ export class WebGPUSets {
                 { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // a_length
                 { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // b_length
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // num_wg_total
+                { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },             // wg_base
             ]
         });
 
@@ -303,24 +304,35 @@ export class WebGPUSets {
             ]
         });
 
-        const lookbackBindGroup = device.createBindGroup({
-            layout: this.lookbackBindGroupLayout,
-            entries: [
-                { binding: 0, resource: { buffer: bufferA } },
-                { binding: 1, resource: { buffer: bufferB } },
-                { binding: 2, resource: { buffer: bufferDPI } },
-                { binding: 3, resource: { buffer: bufferState } },
-                { binding: 4, resource: { buffer: bufferOutput } },
-                { binding: 5, resource: { buffer: bufferTotalCount } },
-                { binding: 6, resource: { buffer: bufferALen } },
-                { binding: 7, resource: { buffer: bufferBLen } },
-                { binding: 8, resource: { buffer: bufferNumWg } },
-            ]
-        });
+        // Lookback runs as consecutive 1-D dispatches of at most MAXWORKGROUP workgroups, each with its own
+        // wg_base: a 2-D dispatch of this spin-waiting kernel never makes forward progress on Apple Metal.
+        const wgBaseBuffers: GPUBuffer[] = [];
+        const lookbackDispatches: { bindGroup: GPUBindGroup, count: number }[] = [];
+        for (let base = 0; base < numWg; base += MAXWORKGROUP) {
+            const bufferWgBase = device.createBuffer({ size: 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(bufferWgBase, 0, new Uint32Array([base]));
+            wgBaseBuffers.push(bufferWgBase);
+            lookbackDispatches.push({
+                count: Math.min(MAXWORKGROUP, numWg - base),
+                bindGroup: device.createBindGroup({
+                    layout: this.lookbackBindGroupLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: bufferA } },
+                        { binding: 1, resource: { buffer: bufferB } },
+                        { binding: 2, resource: { buffer: bufferDPI } },
+                        { binding: 3, resource: { buffer: bufferState } },
+                        { binding: 4, resource: { buffer: bufferOutput } },
+                        { binding: 5, resource: { buffer: bufferTotalCount } },
+                        { binding: 6, resource: { buffer: bufferALen } },
+                        { binding: 7, resource: { buffer: bufferBLen } },
+                        { binding: 8, resource: { buffer: bufferNumWg } },
+                        { binding: 9, resource: { buffer: bufferWgBase } },
+                    ]
+                }),
+            });
+        }
 
         // --- Dispatch ---
-        const dispatchX = Math.min(numWg, MAXWORKGROUP);
-        const dispatchY = Math.ceil(numWg / MAXWORKGROUP);
 
         const subgroupSize = (device.adapterInfo as any)?.subgroupSize || 32;
         const subgroupsPerWg = DPI_WG_SIZE / subgroupSize;
@@ -340,8 +352,10 @@ export class WebGPUSets {
         // Pass 2: Lookback (select pipeline by opMode)
         pass = encoder.beginComputePass();
         pass.setPipeline(this.lookbackPipelines[opMode]);
-        pass.setBindGroup(0, lookbackBindGroup);
-        pass.dispatchWorkgroups(dispatchX, dispatchY);
+        for (const d of lookbackDispatches) {
+            pass.setBindGroup(0, d.bindGroup);
+            pass.dispatchWorkgroups(d.count);
+        }
         pass.end();
 
         device.queue.submit([encoder.finish()]);
@@ -352,6 +366,7 @@ export class WebGPUSets {
 
         // --- Cleanup ---
         bufferALen.destroy(); bufferBLen.destroy(); bufferNumWg.destroy();
+        wgBaseBuffers.forEach(b => b.destroy());
         bufferDPI.destroy(); bufferState.destroy();
         bufferTotalCount.destroy();
 

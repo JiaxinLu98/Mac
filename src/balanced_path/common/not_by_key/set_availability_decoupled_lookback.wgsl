@@ -32,7 +32,7 @@
 const OP_MODE: u32 = 0u;
 
 // ============================================================================
-// Bindings (9 total)
+// Bindings (10 total)
 // ============================================================================
 @group(0) @binding(0) var<storage, read> a: array<u32>;
 @group(0) @binding(1) var<storage, read> b: array<u32>;
@@ -43,6 +43,11 @@ const OP_MODE: u32 = 0u;
 @group(0) @binding(6) var<uniform> a_length: u32;
 @group(0) @binding(7) var<uniform> b_length: u32;
 @group(0) @binding(8) var<uniform> num_wg_total: u32;
+// First workgroup index of this dispatch. 0 for a single (1-D or 2-D) dispatch. Nonzero when the host splits
+// the workgroups over several 1-D dispatches of one pass: a 2-D dispatch of this kernel never makes forward
+// progress on Apple Metal (the spin-wait below deadlocks), while consecutive 1-D dispatches do, and the state
+// array carries the prefix from one dispatch to the next.
+@group(0) @binding(9) var<uniform> wg_base: u32;
 
 // ============================================================================
 // Constants
@@ -117,7 +122,7 @@ fn unpack_value(packed: u32) -> u32 {
 // Helper: Convert 2D workgroup_id to 1D index
 // ============================================================================
 fn get_workgroup_index(wg_id: vec3<u32>) -> u32 {
-    return wg_id.x + wg_id.y * MAX_DISPATCH_X;
+    return wg_base + wg_id.x + wg_id.y * MAX_DISPATCH_X;
 }
 
 // ============================================================================
