@@ -13,9 +13,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(webgpu)
 
-add_executable(App main.cpp)
-target_link_libraries(App PRIVATE webgpu)
-target_copy_webgpu_binaries(App)
+# main.cpp (the unoptimized harness) is not part of the M5 Pro package, only AppOpt is run there.
+set(ECLAT_TARGETS AppOpt)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+    add_executable(App main.cpp)
+    target_link_libraries(App PRIVATE webgpu)
+    target_copy_webgpu_binaries(App)
+    list(PREPEND ECLAT_TARGETS App)
+endif()
 
 add_executable(AppOpt main_opt.cpp)
 target_link_libraries(AppOpt PRIVATE webgpu)
@@ -33,7 +38,7 @@ foreach(SHADER ${SHADER_FILES})
     configure_file(${SHADER} ${CMAKE_CURRENT_BINARY_DIR}/shaders/${SHADER_NAME} COPYONLY)
 endforeach()
 
-foreach(TARGET_NAME App AppOpt)
+foreach(TARGET_NAME ${ECLAT_TARGETS})
     add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${TARGET_NAME}>/shaders"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

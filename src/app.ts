@@ -8,13 +8,13 @@ import { runTPCHQ12Test } from './applications/tpch_q12/tpch_q12';
 import { runEclatV2Test, runEclatInPlaceTest } from './applications/eclat/eclat';
 import { runJaccardGenomeTest } from './applications/jaccard_genome/jaccard_genome';
 import { runGatherBenchTest } from './applications/gather_bench/gather_bench'; // rebuttal experiment
-import { runReachingDefinitionsV0Test } from '../p3hpc/reaching_definitions/test_reaching_definitions'; // P3HPC
-import { runReachingDefinitionsRealTest } from '../p3hpc/reaching_definitions/test_reaching_definitions_real'; // P3HPC
-import { runReachingDefinitionsBatchedTest } from '../p3hpc/reaching_definitions/test_reaching_definitions_batched'; // P3HPC v1
-import { runRDBenchmark } from '../p3hpc/reaching_definitions/test_rd_benchmark'; // P3HPC benchmark + logging (v1/v2a/v2b)
-import { runRDV2Test } from '../p3hpc/reaching_definitions/test_rd_v2'; // P3HPC v2a/v2b validation
-import { runRDBitvectorTest } from '../p3hpc/reaching_definitions/test_rd_bitvector'; // P3HPC bitvector baseline validation
-import { runRDUniverseSweep } from '../p3hpc/reaching_definitions/test_rd_universe_sweep'; // P3HPC universe crossover sweep
+// (not in the M5 Pro package) import { runReachingDefinitionsV0Test } from '../p3hpc/reaching_definitions/test_reaching_definitions'; // P3HPC
+// (not in the M5 Pro package) import { runReachingDefinitionsRealTest } from '../p3hpc/reaching_definitions/test_reaching_definitions_real'; // P3HPC
+// (not in the M5 Pro package) import { runReachingDefinitionsBatchedTest } from '../p3hpc/reaching_definitions/test_reaching_definitions_batched'; // P3HPC v1
+// (not in the M5 Pro package) import { runRDBenchmark } from '../p3hpc/reaching_definitions/test_rd_benchmark'; // P3HPC benchmark + logging (v1/v2a/v2b)
+// (not in the M5 Pro package) import { runRDV2Test } from '../p3hpc/reaching_definitions/test_rd_v2'; // P3HPC v2a/v2b validation
+// (not in the M5 Pro package) import { runRDBitvectorTest } from '../p3hpc/reaching_definitions/test_rd_bitvector'; // P3HPC bitvector baseline validation
+// (not in the M5 Pro package) import { runRDUniverseSweep } from '../p3hpc/reaching_definitions/test_rd_universe_sweep'; // P3HPC universe crossover sweep
 
 (async () => {
     if (navigator.gpu === undefined) {
@@ -97,7 +97,8 @@ import { runRDUniverseSweep } from '../p3hpc/reaching_definitions/test_rd_univer
     // await runReachingDefinitionsBatchedTest(device);  // v1-gterm + v1 correctness, all datasets (needs dev server)
     // await runRDV2Test(device);  // v2a/v2b correctness, all datasets (needs dev server)
     // await runRDBitvectorTest(device);  // bitvector gterm + plain correctness (needs dev server)
-    await runRDBenchmark(device);  // benchmark + unified logging (?impl=v1,v1c,v2a,v2b,bv&n=10&w=2&ds=lua,...)
+    // P3HPC is not in the M5 Pro package, so there is no default experiment here: pass ?app=fusion|micro|eclat.
+    console.log('no ?app= given: use ?app=fusion, ?app=micro or ?app=eclat');
     // await runRDUniverseSweep(device);  // universe crossover sweep (?ds=sqlite3&groups=1,8,64,512,0&n=10&w=2)
     return;
 

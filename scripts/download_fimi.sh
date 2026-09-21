@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/public/fimi"
-BASE_URL="http://fimi.uantwerpen.be/data"
+BASE_URL="https://fimi.uantwerpen.be/data"
 
 mkdir -p "$OUT_DIR"
 
