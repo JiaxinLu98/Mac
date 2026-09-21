@@ -14,7 +14,6 @@ eclat_cpp/data/
 
 # Experiment logs
 apple_logs/
-apple_logs_*.tar.gz
 
 # Compiled data generator (apple_upload/gen_micro_data_mac.sh)
 scripts/create_data
